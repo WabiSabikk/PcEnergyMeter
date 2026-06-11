@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="PcEnergyMeter.App" type="win32" />
+
+  <!--
+    Потужність CPU/GPU (Intel RAPL, AMD) LibreHardwareMonitor читає через драйвер ядра,
+    який ставиться лише з правами адміністратора. Без елевації лишається тільки оцінка.
+    Тому застосунок вимагає адміністратора. Наслідок: автозапуск зроблено через Task Scheduler
+    з найвищими правами (StartupManager), бо елевований процес не стартує тихо з HKCU\Run.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v2">
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compat.v1">
+    <application>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}" />
+      <!-- Windows 10 та Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>

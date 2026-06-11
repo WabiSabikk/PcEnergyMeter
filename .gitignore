@@ -1,0 +1,21 @@
+# Build outputs
+bin/
+obj/
+dist/
+
+# Packages
+*.tar.gz
+*.zip
+
+# IDE
+.vs/
+*.user
+*.suo
+.idea/
+
+# Internal workflow files (not for public repo)
+HANDOFF.md
+TASKS.md
+.claude/
+.plugin-config/
+docs/
