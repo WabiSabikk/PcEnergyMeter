@@ -18,6 +18,10 @@ public sealed class HardwareMonitorService : IDisposable
     private int _openFailures;
     private DateTimeOffset _nextOpenAttempt = DateTimeOffset.MinValue;
     private bool _hardwareErrorLogged;
+    private SensorReading[] _lastSensors = Array.Empty<SensorReading>();
+    private SensorReading[] _updateResult = Array.Empty<SensorReading>();
+    private Task? _inflightUpdate;
+    private bool _updateTimeoutLogged;
 
     public HardwareMonitorService()
     {
@@ -26,8 +30,14 @@ public sealed class HardwareMonitorService : IDisposable
             IsCpuEnabled = true,
             IsGpuEnabled = true,
             IsMemoryEnabled = true,
-            IsMotherboardEnabled = true,
-            IsControllerEnabled = true,
+            // Материнка (SuperIO через ISA/LPC) і контролери (вбудований EC, фан-контролери) ВИМКНЕНІ
+            // навмисно. На кожному Update LHM опитує цю шину, шукаючи SuperIO-чип, але та сама шина й EC
+            // монополізовані ASUS Armoury Crate / AsusFanControlService — їхнє утримання шини підвішувало
+            // Update(), а отже й увесь застосунок, на нулях. На цьому залізі SuperIO взагалі не дає жодного
+            // датчика: напруга ядра йде від CPU (Core VID), потужність — від GPU (NVAPI/ADL). Тож вимкнення
+            // прибирає конкуренцію без втрати даних. Watchdog-тайм-аут нижче страхує від будь-якого іншого блокування.
+            IsMotherboardEnabled = false,
+            IsControllerEnabled = false,
             IsStorageEnabled = true,
             IsBatteryEnabled = true
         };
@@ -75,25 +85,32 @@ public sealed class HardwareMonitorService : IDisposable
             Open();
         }
 
-        var sensors = Array.Empty<SensorReading>();
+        var sensors = _lastSensors;
         if (_opened)
         {
-            try
+            var (fresh, status) = UpdateSensorsWithWatchdog(TimeSpan.FromSeconds(4));
+            switch (status)
             {
-                _computer.Accept(_visitor);
-                sensors = _computer.Hardware.SelectMany(ReadHardwareSensors).ToArray();
-            }
-            catch (Exception exception)
-            {
-                // Читання датчиків впало посеред роботи — знімок не валимо, лишаємось на оцінці. Закриваємо
-                // монітор і плануємо повторний Open із паузою, а не вимикаємось назавжди: проблема (напр.
-                // інший екземпляр чи приспаний драйвер) часто тимчасова й минає сама.
-                _opened = false;
-                _openFailures++;
-                _nextOpenAttempt = DateTimeOffset.Now.AddSeconds(Math.Min(60, 5 * _openFailures));
-                sensors = Array.Empty<SensorReading>();
-                TryCloseQuietly();
-                LogHardwareError("Update", exception);
+                case UpdateStatus.Completed:
+                    sensors = fresh!;
+                    _lastSensors = fresh!;
+                    break;
+
+                case UpdateStatus.TimedOut:
+                    // Читання LHM заблоковане (типово — ASUS Armoury Crate тримає EC/ISA-шину). Не валимо
+                    // застосунок і не вимикаємо LHM: цей тік ідемо на останніх датчиках + оцінці, а фонова
+                    // задача добіжить, щойно шина звільниться. Так UI лишається живим замість зависання.
+                    sensors = _lastSensors;
+                    break;
+
+                case UpdateStatus.Faulted:
+                    // Справжній збій читання — закриваємо й плануємо повторний Open із паузою, а не вимикаємось назавжди.
+                    _opened = false;
+                    _openFailures++;
+                    _nextOpenAttempt = DateTimeOffset.Now.AddSeconds(Math.Min(60, 5 * _openFailures));
+                    sensors = Array.Empty<SensorReading>();
+                    TryCloseQuietly();
+                    break;
             }
         }
 
@@ -114,6 +131,66 @@ public sealed class HardwareMonitorService : IDisposable
             loadSensors,
             temperatureSensors,
             monitors);
+    }
+
+    private enum UpdateStatus
+    {
+        Completed,
+        TimedOut,
+        Faulted
+    }
+
+    /// <summary>
+    /// Оновлює датчики LHM на фоновій задачі з тайм-аутом. Нативний Update() може заблокуватись, якщо
+    /// інший інструмент (ASUS Armoury Crate, HWiNFO тощо) тримає апаратну шину — без цього захисту
+    /// блокування підвішувало б увесь вимірювальний цикл назавжди. Повертає свіжі датчики лише при
+    /// успіху; інакше викликач лишається на останніх даних (TimedOut) або переоткриває LHM (Faulted).
+    /// </summary>
+    private (SensorReading[]? Sensors, UpdateStatus Status) UpdateSensorsWithWatchdog(TimeSpan timeout)
+    {
+        // Попередній апдейт ще висить у нативному коді (шину досі тримають) — не плодимо заблоковані потоки.
+        if (_inflightUpdate is { IsCompleted: false })
+        {
+            return (null, UpdateStatus.TimedOut);
+        }
+
+        var task = Task.Run(() =>
+        {
+            _computer.Accept(_visitor);
+            _updateResult = _computer.Hardware.SelectMany(ReadHardwareSensors).ToArray();
+        });
+        _inflightUpdate = task;
+
+        try
+        {
+            // Wait(timeout): true — успіх; кидає при збої задачі; false — тайм-аут.
+            if (task.Wait(timeout))
+            {
+                _inflightUpdate = null;
+                // Успішний апдейт = LHM здоровий: переозброюємо журнал, щоб наступна проблема записалась знову.
+                _updateTimeoutLogged = false;
+                _hardwareErrorLogged = false;
+                return (_updateResult, UpdateStatus.Completed);
+            }
+
+            // Тайм-аут: лишаємо задачу добігати у фоні (звільниться, коли шина звільниться). Логуємо раз на смугу.
+            if (!_updateTimeoutLogged)
+            {
+                _updateTimeoutLogged = true;
+                LogHardwareError(
+                    "Update timeout",
+                    new TimeoutException(
+                        $"Sensor update did not finish within {timeout.TotalSeconds:0}s. Another tool likely holds the hardware bus (e.g. ASUS Armoury Crate). Falling back to estimates."));
+            }
+
+            return (null, UpdateStatus.TimedOut);
+        }
+        catch (Exception exception)
+        {
+            _inflightUpdate = null;
+            LogHardwareError("Update", (exception as AggregateException)?.GetBaseException() ?? exception);
+            return (null, UpdateStatus.Faulted);
+        }
     }
 
     public void Dispose()
