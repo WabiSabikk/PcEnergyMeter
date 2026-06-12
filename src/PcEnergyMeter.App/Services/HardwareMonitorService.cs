@@ -15,7 +15,8 @@ public sealed class HardwareMonitorService : IDisposable
     private ComputerProfile? _profile;
     private DateTimeOffset _lastProfileRead = DateTimeOffset.MinValue;
     private bool _opened;
-    private bool _lhmFailed;
+    private int _openFailures;
+    private DateTimeOffset _nextOpenAttempt = DateTimeOffset.MinValue;
     private bool _hardwareErrorLogged;
 
     public HardwareMonitorService()
@@ -34,7 +35,7 @@ public sealed class HardwareMonitorService : IDisposable
 
     public void Open()
     {
-        if (_opened || _lhmFailed)
+        if (_opened || DateTimeOffset.Now < _nextOpenAttempt)
         {
             return;
         }
@@ -46,20 +47,30 @@ public sealed class HardwareMonitorService : IDisposable
             // між двома вибірками), тому одразу після Open частина значень — нулі. Робимо холостий апдейт.
             _computer.Accept(_visitor);
             _opened = true;
+            _openFailures = 0;
+            // Успішний Open закриває попередню смугу збоїв: дозволяємо журналу знову записати причину,
+            // якщо LHM відвалиться пізніше посеред сесії.
+            _hardwareErrorLogged = false;
         }
         catch (Exception exception)
         {
-            // LibreHardwareMonitor може впасти на Open: напр. ArgumentNullException 'identity' у
-            // Mutexes.Open, або брак прав на драйвер ядра. Це НЕ має класти весь застосунок у нуль —
-            // далі читаємо WMI-профіль і даємо оцінку. Причину пишемо у hardware.log (раз).
-            _lhmFailed = true;
-            LogHardwareError("Open", exception);
+            // LibreHardwareMonitor падає на Open: напр. ArgumentNullException 'identity' у Mutexes.Open
+            // (типово, коли драйвер ядра тримає інший екземпляр), або брак прав на драйвер. РАНІШЕ ми
+            // вимикали LHM назавжди — один невдалий старт лишав «лічильники по 0» на всю сесію. Тепер
+            // плануємо повтор із наростаючою паузою (до 60 с), щоб відновитись, щойно драйвер звільниться.
+            // До відновлення працюємо на WMI-профілі й оцінці. Причину пишемо у hardware.log (раз).
+            // Open() міг пройти частково (драйвер піднявся, а Accept кинув) — закриваємо, щоб наступний
+            // повтор переініціалізував з чистого стану, а не відкривав уже відкритий Computer.
+            _openFailures++;
+            _nextOpenAttempt = DateTimeOffset.Now.AddSeconds(Math.Min(60, 5 * _openFailures));
+            TryCloseQuietly();
+            LogHardwareError($"Open (attempt {_openFailures})", exception);
         }
     }
 
     public HardwareSnapshot Read(AppSettings settings)
     {
-        if (!_opened && !_lhmFailed)
+        if (!_opened)
         {
             Open();
         }
@@ -74,10 +85,14 @@ public sealed class HardwareMonitorService : IDisposable
             }
             catch (Exception exception)
             {
-                // Якщо читання датчиків впало посеред роботи — знімок не валимо, лишаємось на оцінці.
-                _lhmFailed = true;
+                // Читання датчиків впало посеред роботи — знімок не валимо, лишаємось на оцінці. Закриваємо
+                // монітор і плануємо повторний Open із паузою, а не вимикаємось назавжди: проблема (напр.
+                // інший екземпляр чи приспаний драйвер) часто тимчасова й минає сама.
                 _opened = false;
+                _openFailures++;
+                _nextOpenAttempt = DateTimeOffset.Now.AddSeconds(Math.Min(60, 5 * _openFailures));
                 sensors = Array.Empty<SensorReading>();
+                TryCloseQuietly();
                 LogHardwareError("Update", exception);
             }
         }
@@ -103,10 +118,24 @@ public sealed class HardwareMonitorService : IDisposable
 
     public void Dispose()
     {
-        if (_opened)
+        // Закриваємо безумовно: Open() міг піднятись частково (драйвер є, але _opened лишився false),
+        // і тоді if(_opened) пропустив би Close, лишивши хендл драйвера висіти до наступного запуску.
+        TryCloseQuietly();
+        _opened = false;
+    }
+
+    private void TryCloseQuietly()
+    {
+        // Безпечне закриття LHM з будь-якого стану (повністю відкритий, частково відкритий після збою
+        // Open/Update, або взагалі не відкритий). Потрібне, щоб наступний Open() переініціалізував з нуля,
+        // а Dispose не лишив хендл драйвера. Close зламаного/невідкритого монітора сам може кинути — глушимо.
+        try
         {
             _computer.Close();
-            _opened = false;
+        }
+        catch
+        {
+            // Закриття зламаного монітора саме може кинути — ігноруємо, нас цікавить лише повторний Open.
         }
     }
 

@@ -6,6 +6,9 @@ namespace PcEnergyMeter.App;
 
 internal static class Program
 {
+    // Доступний для MainWindow, щоб після створення вікна запустити слухача показу від другого екземпляра.
+    public static SingleInstanceGuard? InstanceGuard { get; private set; }
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -20,6 +23,17 @@ internal static class Program
             return 0;
         }
 
+        // Єдиний екземпляр на сесію. Автозадача onlogon + ручний запуск інакше дають два процеси,
+        // які б'ються за драйвер ядра LHM — переможений показує нулі. Другий екземпляр сигналить
+        // наявному показати вікно й виходить.
+        var guard = new SingleInstanceGuard();
+        if (!guard.TryAcquire())
+        {
+            guard.Dispose();
+            return 0;
+        }
+
+        InstanceGuard = guard;
         try
         {
             BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
@@ -29,6 +43,10 @@ internal static class Program
         {
             ReportCrash(exception);
             return 1;
+        }
+        finally
+        {
+            guard.Dispose();
         }
     }
 

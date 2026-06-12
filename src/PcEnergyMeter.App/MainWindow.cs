@@ -98,6 +98,10 @@ public sealed class MainWindow : Window
         Content = BuildLayout();
         CreateTrayIcon();
 
+        // Коли другий екземпляр намагається запуститись, він сигналить нам показати вікно замість
+        // того, щоб підняти власний процес. Слухач спрацьовує у фоновому потоці, тож повертаємось у UI-потік.
+        Program.InstanceGuard?.StartShowListener(() => Dispatcher.UIThread.Post(ShowFromTray));
+
         _timer.Interval = TimeSpan.FromSeconds(1);
         _timer.Tick += (_, _) => RefreshSnapshot();
         Opened += (_, _) =>
