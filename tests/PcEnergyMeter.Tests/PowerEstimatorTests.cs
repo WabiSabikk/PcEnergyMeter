@@ -46,7 +46,7 @@ public sealed class PowerEstimatorTests
         var estimate = new PowerEstimator().Estimate(profile, Array.Empty<SensorReading>(), Array.Empty<SensorReading>(), Array.Empty<MonitorReading>(), new AppSettings());
 
         Assert.True(estimate.TotalWatts > 0);
-        Assert.Contains(estimate.Notes, note => note.Contains("Датчики потужності", StringComparison.Ordinal));
+        Assert.Contains(estimate.Notes, note => note.Contains("No power sensors", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -76,9 +76,9 @@ public sealed class PowerEstimatorTests
                 100,
                 50,
                 1,
-                "увімкнено",
+                "on",
                 true,
-                new[] { "DDC/CI відповів." })
+                new[] { "DDC/CI responded." })
         };
 
         var estimate = new PowerEstimator().Estimate(
@@ -88,7 +88,7 @@ public sealed class PowerEstimatorTests
             monitors,
             new AppSettings { MonitorMinimumWatts = 10, MonitorMaximumWatts = 30 });
 
-        var monitorSources = estimate.Sources.Where(source => source.Category == "Монітор").ToArray();
+        var monitorSources = estimate.Sources.Where(source => source.Category == "Monitor").ToArray();
 
         Assert.Single(monitorSources);
         Assert.Equal("estimated", monitorSources[0].Decision);
