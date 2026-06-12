@@ -14,7 +14,7 @@ public sealed class HardwareMonitorService : IDisposable
     private DateTimeOffset _lastMonitorRead = DateTimeOffset.MinValue;
     private ComputerProfile? _profile;
     private DateTimeOffset _lastProfileRead = DateTimeOffset.MinValue;
-    private bool _opened;
+    private volatile bool _opened;
     private int _openFailures;
     private DateTimeOffset _nextOpenAttempt = DateTimeOffset.MinValue;
     private bool _hardwareErrorLogged;
@@ -82,7 +82,9 @@ public sealed class HardwareMonitorService : IDisposable
     {
         if (!_opened)
         {
-            Open();
+            // Open() теж під watchdog: завантаження ring0-драйвера може зависнути, якщо його перехопив
+            // антивірус (Avast автопісочниця). Без цього Read() замерзав би тут і весь UI лишався на 0.
+            OpenWithWatchdog(TimeSpan.FromSeconds(6));
         }
 
         var sensors = _lastSensors;
@@ -138,6 +140,57 @@ public sealed class HardwareMonitorService : IDisposable
         Completed,
         TimedOut,
         Faulted
+    }
+
+    /// <summary>
+    /// Викликає Open() на фоновій задачі з тайм-аутом. Завантаження ring0-драйвера (PawnIO) усередині
+    /// Open може зависнути, коли його перехоплює захисне ПЗ (напр. Avast пісочить процес). Без захисту
+    /// Read() замерзав би тут і весь застосунок лишався на 0. При зависанні цей тік іде на оцінці + банері,
+    /// а задача добігає у фоні, щойно драйвер дозволять. Справжні дані датчиків повертаються лише після
+    /// додавання застосунку у винятки антивіруса — кодом перехоплення драйвера не оминути.
+    /// </summary>
+    private void OpenWithWatchdog(TimeSpan timeout)
+    {
+        if (_opened || DateTimeOffset.Now < _nextOpenAttempt)
+        {
+            return;
+        }
+
+        // Попередня спроба відкриття ще висить у нативному коді (драйвер заблокований) — не плодимо потоки.
+        if (_inflightUpdate is { IsCompleted: false })
+        {
+            return;
+        }
+
+        var task = Task.Run(Open);
+        _inflightUpdate = task;
+
+        try
+        {
+            if (task.Wait(timeout))
+            {
+                // Open сам обробляє успіх і збій (журнал + backoff). Тут лише знімаємо inflight.
+                _inflightUpdate = null;
+            }
+            else
+            {
+                // Open завис: драйвер ring0 ймовірно перехоплений антивірусом. Лишаємо задачу добігати,
+                // даємо паузу й логуємо раз, щоб не спамити. UI цей тік покаже оцінку, а не замерзне.
+                _nextOpenAttempt = DateTimeOffset.Now.AddSeconds(30);
+                if (!_updateTimeoutLogged)
+                {
+                    _updateTimeoutLogged = true;
+                    LogHardwareError(
+                        "Open timeout",
+                        new TimeoutException(
+                            $"LHM Open did not finish within {timeout.TotalSeconds:0}s. The ring0 driver is likely blocked or sandboxed by security software (e.g. Avast auto-sandbox). Add the app folder to the antivirus exceptions to read real sensors. Showing estimates until then."));
+                }
+            }
+        }
+        catch
+        {
+            _inflightUpdate = null;
+        }
     }
 
     /// <summary>
